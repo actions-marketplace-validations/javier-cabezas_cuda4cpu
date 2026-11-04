@@ -87,7 +87,10 @@ at kernel.cu:12 and kernel.cu:15. CUDA requires every thread of a block to reach
 ```
 
 `CUDA4CPU_DIVERGENT_BARRIERS` chooses what happens: `warn` (the default), `error`
-(abort, to stop in a debugger) or `ignore`.
+(abort, to stop in a debugger) or `ignore`. A cooperative group's `sync()`
+keeps CUDA's signature, which gives it no way to know its caller's line: the
+report names it (`cooperative_groups::thread_block::sync()`), and threads at
+two different `sync()` calls aren't reported.
 
 **Threads taking turns in loops: `CUDA4CPU_INTERLEAVE`.** `auto` (the default)
 chooses per kernel how often the threads of a block take turns in their loops.
@@ -137,11 +140,13 @@ cuda4cpu: warning: 2 allocations of device memory (8192 bytes in all), made at s
 ```
 
 Each allocation records its call stack (a few microseconds), and the report
-finds the program's line in its debug information with `addr2line`, from
+finds the program's line in its debug information with `llvm-symbolizer`
+(any `llvm-symbolizer-N` on the `PATH` will do), or else `addr2line`, from
 binutils: build with `-g` for lines, or the report names the function.
-(binutils 2.42, Ubuntu 24.04's, misreads Clang's DWARF 5 in unoptimized
-builds: the line is right, but the file is the copy that the rewriter
-compiled, `saxpy.cu.cpp` or a path in a temporary directory.) An
+(binutils 2.42, Ubuntu 24.04's `addr2line`, misreads Clang's DWARF 5 in
+unoptimized builds: the line is right, but the file is the copy that the
+rewriter compiled, `saxpy.cu.cpp` or a path in a temporary directory.
+`llvm-symbolizer` doesn't.) An
 allocation made through the program's own wrapper of `cudaMalloc` is
 reported at the wrapper's line. The report comes after static objects are
 destroyed and destructor functions have run, so memory they free isn't

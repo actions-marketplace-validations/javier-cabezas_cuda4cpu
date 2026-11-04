@@ -45,9 +45,12 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
   in CUDA, with helpers in `cuda4cpu::detail::cg`. `thread_group` is the
   type-erased base that every group converts to. Tiles of up to 32 threads
   use the warp functions with the tile's lanes as the mask; larger tiles use
-  `thread_block::sync_warps`. Block and grid `sync()` take a defaulted
-  `std::source_location`, so the divergent barrier check reports the
-  caller's line.
+  `thread_block::sync_warps`. Block and grid `sync()` keep CUDA's
+  signature, so they can't know their caller's line: the divergent barrier
+  check names them (`block_sync_name`, `grid_sync_name`, with line 0), and
+  can't tell two of them apart. A macro named `sync` would break POSIX's
+  `sync()` and every other `sync` member. `coalesced_threads()` is a macro,
+  defined at the end of the header, for `cuda4cpu_coalesced_threads`.
 - `include/cuda/*.hpp`: the CUDA runtime API (types, errors, device, memory,
   streams, events), plus device-side `atomics.hpp` (on `std::atomic_ref`) and
   `math.hpp`. All CUDA names live in the **inline namespace
@@ -184,7 +187,8 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
   the CMake languages need 4.1 or later. CI's setup action installs
   Kitware's CMake 4.2.3, cached, for that.
   Both handle `.hip` files and `-x cu`/`-x hip`. The rewritten sources go in
-  `<output>.cuda4cpu-src/` (a temporary directory without `-o`), removed
+  `<output>.cuda4cpu-src/` (a temporary directory without `-o`, or when the
+  output isn't a file, as `/dev/null`, or its directory can't be written), removed
   after the compile: their paths reach the command line and the
   preprocessed output, so they must be the same on every build for ccache to
   hit. So the dependencies the compiler writes (`-MD`, `-MF`, `-M`, ...)
@@ -279,9 +283,9 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
   (`FETCHCONTENT_SOURCE_DIR_CUDA4CPU`) and checks that the bugs are exposed,
   including the line AddressSanitizer reports in `out_of_bounds.cu`.
   The project and the README's `FetchContent` snippet pin the latest release
-  (`GIT_TAG v0.4.1`): update both, the `VERSION` in the top-level
+  (`GIT_TAG v0.5.0`): update both, the `VERSION` in the top-level
   `CMakeLists.txt`, `server.json`'s `version` and image tag, and the
-  action's `@v0.4.1` in the README and `docs/usage.md`, when tagging a new
+  action's `@v0.5.0` in the README and `docs/usage.md`, when tagging a new
   one. The `Packages` workflow fails a release whose tag doesn't match.
 - Packages (`.github/workflows/release.yml`, the `Packages` workflow): the
   release archive (`cuda4cpu-linux-x86_64.tar.gz`, with a versioned top
@@ -325,8 +329,9 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
     on each launch), and `CUDA4CPU_LEAK_CHECK=warn` reports exactly the
     leaks (device, managed, pinned, HIP's pinned and graph memory), by line
     (it's built with `-g`), largest first, by function in a copy built
-    without `-g`, and by offset without `addr2line`, and not memory that a static destructor or a destructor function
-    frees
+    without `-g`, and by offset without a symbolizer, with `llvm-symbolizer`
+    alone (under a versioned name) and `addr2line` alone, and not memory
+    that a static destructor or a destructor function frees
   - `warp`: every shuffle and vote variant (widths, partial warps), exited
     lanes, and lanes that branch to `__syncthreads()` (once, and in a loop)
   - `atomics`: every atomic function, racing across blocks
@@ -338,7 +343,10 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
     warps and tiles, tiles of several warps that sync independently, or
     while some of their threads are at `__syncthreads()` or return,
     `coalesced_threads()` in a branch (warp-aggregated atomics), and
-    `grid.sync()` across rounds of a cooperative launch
+    `grid.sync()` across rounds of a cooperative launch, and the forms of the
+    calls that are macros (using-declarations of `coalesced_threads`, calls
+    around the macros, qualified `::coalesced_threads()`,
+    `cuda4cpu::__activemask()` and `::cudaLaunchKernel`)
   - `runtime`: error codes and the last error, launch limits, allocation,
     copies, memset, symbols, events, device queries and intrinsics, through
     `cuda_runtime.h` only. It and `hip_memory` run with
@@ -394,6 +402,8 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
     operation checks in each mode (error mode must abort with a single
     report). `divergent_barrier_later`: one thread diverges after every thread
     has started, and the report must name its line numbers.
+    `divergent_barrier_group`: `__syncthreads()` and a cooperative group's
+    `sync()`, which the report names.
   - `gdb` (`gdb_test.cmake`, if gdb is installed): a breakpoint conditioned on
     `$threadIdx("x")`, the built-in variables, a backtrace that ends where
     the fiber started, listing the block's threads (`cuda4cpu threads`), and
@@ -402,7 +412,7 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
     syntax that must stay untouched, errors, and shadow headers with depfiles.
   - `driver`: builds `samples/vector_add.cu` with the build-tree
     `cuda4cpu-c++`, in one step and with separate compile and link, with its
-    default compiler and `CXX` set to the driver itself. `driver_hipcc` and
+    default compiler and `CXX` set to the driver itself, and to `-o /dev/null`. `driver_hipcc` and
     `driver_x_hip` build a HIP `.cpp` file with `cuda4cpu-hipcc` (and an
     AMD-only option) and with `cuda4cpu-c++ -x hip`. `driver_nvcc` builds it
     with `cuda4cpu-nvcc` and nvcc's options for the GPU, and
@@ -755,14 +765,19 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
   allocations each time they're committed) and `CUDA4CPU_LEAK_CHECK` (warn,
   ignore). With leak checks on, `allocate_aligned` and graph allocations
   keep the `backtrace()` of the call (`record_call_stack`), and the report
-  runs `addr2line` on the program's frames, in batches: the first that
+  runs `llvm-symbolizer --output-style=GNU` (or the latest
+  `llvm-symbolizer-N` on the `PATH`, as LLVM's Debian packages name it) or
+  else `addr2line`, which print the same, on the program's frames, in
+  batches (binutils 2.42's `addr2line` names the rewriter's copy of a
+  source in Clang's unoptimized DWARF 5): the first that
   isn't cuda4cpu's, by its function's namespace or its file, whose path
   ends in `cuda/memory.hpp` or `hip/hip_runtime_api.h` (inlined and
   static functions have no namespace in the debug information; the path,
   not the disk, because headers move and `-ffile-prefix-map` changes the
   start). Without lines, the report names the function, or the object and
   offset. The public signatures stay CUDA's: no `std::source_location`
-  parameters on the allocation functions. They are `[[gnu::noinline]]`, so
+  parameters on the allocation functions (nor on any CUDA or HIP function:
+  see `__syncthreads()` below for the macros that pass a call's line). They are `[[gnu::noinline]]`, so
   that the program's call has its own line: Clang at `-O1` and above loses
   where an inlined call was when it unrolls or merges it, and the report
   then names only the function. `report_leaks` is a `[[gnu::destructor(101)]]` of
@@ -794,8 +809,10 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
   alternate signal stack, unless the thread has one. The report is written
   without allocating, once per process (`crash_reported`, which cuda4cpu's
   own aborts set first). `kernel_closure::site` is the launch's
-  `std::source_location`, a defaulted argument of `launch()`,
-  `cudaLaunchKernel` and `cudaLaunchCooperativeKernel`. In direct mode,
+  `std::source_location`, a defaulted argument of `launch()`, and the
+  first argument of `cuda4cpu_cudaLaunchKernel`,
+  `cuda4cpu_cudaLaunchCooperativeKernel` and `cuda4cpu_hipExtLaunchKernel`,
+  which the macros with the CUDA and HIP names call. In direct mode,
   `threadIdx` can't be trusted: GCC and Clang keep it in a register and
   sink its stores out of the loop when nothing in the kernel can read it
   (a volatile store made a CUDA thread that checks bounds 45% slower with
@@ -816,7 +833,23 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
 - `__syncthreads()` is a function-like macro passing `__FILE__` and `__LINE__`.
   The divergent barrier check compares them, not return addresses: the
   compiler inlines a lambda-launched kernel into both `run_direct` and
-  `run_one`, so one call site has several addresses.
+  `run_one`, so one call site has several addresses. `__activemask()`,
+  `coalesced_threads()`, `cudaLaunchKernel`, `cudaLaunchCooperativeKernel`
+  and `hipExtLaunchKernel` are macros too, for functions that take the call's
+  place first (`defines.hpp`, `cooperative_groups.h`, `hip_ext.h`). The
+  functions keep CUDA's and HIP's signatures, for code that takes their
+  address or calls them as `(name)(...)`, which shares one place. A macro's
+  expansion starts with a name in the same namespace, so `::cudaLaunchKernel(...)`,
+  `cuda4cpu::__activemask()` and `cg::coalesced_threads()` keep working, and
+  it must be defined after the function, or it would rename its definition.
+  `cuda4cpu_activemask` and `cuda4cpu_coalesced_threads` are also brought to
+  global scope by using-declarations, for unqualified calls in any namespace
+  and for `::coalesced_threads()` after a using-declaration of it there.
+  `coalesced_threads()` passes a `cooperative_groups::cuda4cpu_place`, so
+  that argument-dependent lookup finds its function after
+  `using cooperative_groups::coalesced_threads;` in another namespace.
+  Like `__syncthreads`, the macros break members of the program's classes
+  with those names. Never add parameters to CUDA's or HIP's functions.
 - AddressSanitizer: `__sanitizer_start/finish_switch_fiber` are weak
   references, called only when the runtime is present. Every switch goes
   through `fibers::switch_to`/`start_fiber`, which call `sanitizer_leave` as
