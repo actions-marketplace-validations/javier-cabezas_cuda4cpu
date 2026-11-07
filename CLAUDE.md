@@ -97,6 +97,30 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
   `float2`/`double2`, with CUDA's formulas (scaled division and absolute
   value, `cuCfmaf`'s order of additions). The HIP names are macros for the
   CUDA ones, except `hipCsqabsf`/`hipCsqabs`.
+- `include/mma.h`: CUDA's warp matrix functions (`nvcuda::wmma`), for half,
+  bfloat16, tf32, double and 8-bit integers. Lane l holds elements
+  `l * num_elements ...` of the tile, modulo its size, in the order of the
+  fragment's layout (row-major for accumulators), so loads are contiguous;
+  half's A and B have CUDA's 16 elements per lane, so lanes hold copies.
+  `load_matrix_sync`, `store_matrix_sync` and `mma_sync` sync the warp, as
+  PTX's `.sync` does, and `store_matrix_sync` again after its stores (a
+  GPU's are one instruction). `mma_sync` converts A and B into a thread-local buffer
+  per warp (the block's, like `__shared__`), syncs, and each lane computes
+  its row of D: exact products, float sums in order of k (`fma` only for
+  double: without `-mfma` it's a libm call, and float products of these
+  types are exact). Syncs are about half of its time; a warp operation that
+  the releasing lane computes would need one.
+- `include/cuda/async_copy.hpp` (`cuda/pipeline`, `cuda/barrier`) and
+  `include/cooperative_groups/memcpy_async.h`: libcu++'s asynchronous
+  copies and cooperative groups'. A copy is done when `memcpy_async`
+  returns (a group's: its first thread copies it all, `detail::group_copy`,
+  since a tile of a partial warp has fewer threads than its size),
+  so pipelines of a thread do nothing, and `cg::wait` syncs the group.
+  `cuda::barrier` counts arrivals in atomics and waits with
+  `thread_block::interleave()`, so the block's other threads run. Only
+  thread-scope pipelines. `cuda/cmath` (`ceil_div`, `round_up`,
+  `round_down`) and `cuda/std/type_traits` (`cuda::std`, a using-directive
+  of `::std`) are libcu++'s too; code in namespace `cuda` writes `::std::`.
 - `include/hip/`: HIP, on top of the CUDA API.
   - `hip_runtime_api.h`: HIP's runtime API. Every HIP name that is a CUDA
     name with another prefix is a `#define` for it (`hipMalloc` →
@@ -121,7 +145,33 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
     `HIP_TEMPLATE_KERNEL_LAUNCH`), `HIP_DYNAMIC_SHARED`, `hipThreadIdx_x`
     and the like, and the `__HIP_ARCH_HAS_*` macros.
   - `hip_common.h` defines `__HIP_PLATFORM_NVIDIA__`, and `__HIPCC__` with
-    `__CUDACC__`.
+    `__CUDACC__`. With `__HIP_PLATFORM_AMD__` (the drivers'
+    `--cuda4cpu-platform=amd` or `CUDA4CPU_HIP_PLATFORM=amd`, which pass all
+    the macros; `hip_platform` in the driver), HIP's AMD platform instead:
+    an RDNA3 GPU, `gfx1100` unless a `__gfx11xx__` macro names another
+    (`--offload-arch`), with `__AMDGCN__`, `__GFX11__`,
+    `__AMDGCN_WAVEFRONT_SIZE__` 32 and `CUDA4CPU_AMDGPU_TARGET`, which
+    `hipGetDeviceProperties` reports as `gcnArchName` (and `major`/`minor`).
+    `__HIP_DEVICE_COMPILE__` stays undefined, like `__CUDA_ARCH__`. The
+    rewriter's HIP prologue defines `__HIP_PLATFORM_NVIDIA__` only without
+    it.
+  - `amdgcn.h` (included by `hip_runtime.h` on the AMD platform): AMD's
+    `__builtin_amdgcn_*`, phase 1 of the roadmap's plan, as inline functions
+    at global scope (code calls them as `::__builtin_amdgcn_...`; both GCC
+    and Clang accept the names). Lane operations are macros, like
+    `__activemask()`, for `cuda4cpu_amdgcn_<name>` functions that take the
+    call's place first, and go through `detail::amdgcn::exchange`: EXEC is
+    the lanes that reach that call together (`warp_active_mask`, so lanes
+    in two branches don't merge), each lane writes its value to a
+    thread-local slot of its warp, a `__syncwarp(exec)` waits for the
+    others, every lane copies all the slots, and a second one keeps them
+    from being overwritten too early. The builtins' names are functions too,
+    for calls around the macros, which share one place. DPP (`dpp_source`), `ds_swizzle` and `permlane` compute each
+    lane's source from LLVM's encodings (`SIDefines.h`). `s_barrier` is a
+    `__syncthreads()` named `s_barrier_name` for the divergent barrier
+    check, and `s_sleep` calls `thread_block::interleave()`, so that
+    spin-waits progress. Builtins with `ext_vector_type` operands will need
+    Clang (the user's decision), and go under `__clang__`.
 - `lib/cuda4cpu.cpp`: the main compiled source. It holds all the fiber code
   (guarded stacks, the x86-64 assembly context switch and its
   `ucontext`/`_setjmp` fallback, the barrier scheduler, the per-OS-thread
@@ -148,7 +198,16 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
   - turns `(void *)kernel` elsewhere into `cuda4cpu::kernel_address(kernel)`,
     for the `__global__` functions it has seen (`find_kernels`)
   - turns `.gridDim`/`->gridDim` (and `blockDim`) into `cuda4cpu_gridDim`,
-    the name of the `cudaKernelNodeParams` fields
+    the name of the `cudaKernelNodeParams` fields, and so the variables,
+    parameters and fields the program declares with those names, where the
+    declaration is in scope (`find_dim_variables`), as the tensor-core
+    samples' `dim3 gridDim;` in host code: after a type (`dim3`, `&`, `*`,
+    `std::vector<dim3>`), or a later declarator of a statement that starts
+    with a type; a parameter's scope is the function's body, past a
+    constructor's initializers, or a for/if/while/switch statement. Not
+    member functions defined out of line.
+  - turns `extern __shared__ T x[][N]` into a pointer to arrays,
+    `dynamic_shared<T[N]>()`
   - turns `clock()` inside `__global__`/`__device__` bodies into
     `cuda4cpu::device_clock()`
   - inserts `cuda4cpu::loop_tick();` after the `{` of the outermost loops of
@@ -257,8 +316,9 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
   cuda-samples, Rodinia and rocm-examples (HIP), pinned by revision, with
   their sources, include directories, arguments and checks: `expect` and
   `reject` are output regexes, `verified: false` marks programs that don't
-  check their results, `skip` gives a reason not to run one, and `timeout`
-  gives a long program more time (such programs start first). `run.py`
+  check their results, `skip` gives a reason not to run one, `timeout`
+  gives a long program more time (such programs start first), and `env`
+  sets environment variables (the tensor-core samples' compute capability). `run.py`
   fetches the suites, builds each program with `cuda4cpu-c++`, or
   `cuda4cpu-hipcc` for suites with `"driver": "hipcc"` (`.c` files with the
   C compiler), runs it, and reports. `baseline.json` holds the expected status of each
@@ -268,8 +328,9 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
   Run it locally with
   `compat/run.py --driver build/release/tools/cuda4cpu-c++ --work /tmp/compat --filter 'rodinia/*'`.
   `compat/upstream-bugs/` holds fixes, not reported upstream, for bugs that
-  cuda4cpu-mcp's `check` found in the suite's programs, against the pinned
-  revisions. The suite runs the programs unpatched.
+  cuda4cpu-mcp's `check` (or a comparison with the host's results) found in
+  the suite's programs, against the pinned revisions. The suite runs the
+  programs unpatched.
 - `docs/`: the user documentation that the README links to: `usage.md`
   (building, using it in a project, what the rewriter does), `features.md`,
   `hip.md`, `compatibility.md`, `how-it-works.md`, `debugging.md` and
@@ -377,6 +438,21 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
   - `complex` (`complex.cu`): cuComplex.h against `long double` arithmetic
     on random operands, the overflow and underflow its formulas avoid, and a
     DFT in a kernel
+  - `async_copy` (`async_copy.cu`): copies into shared memory through a
+    thread's pipeline, a block and its tiles (`cg::memcpy_async`), and a
+    block's `cuda::barrier`, read by other threads after the wait; a barrier
+    of half the block's threads with a completion function, over several
+    phases, with a thread that drops out; `<cuda/cmath>` and `cuda::std`.
+  - `wmma` (`wmma.cu`): every type, shape and layout of A, B, C and D of
+    `mma.h` against an exact host reference (small integers, and tf32
+    inputs with low bits that must be ignored), fragments changed element by
+    element (A and B, each shape, column-major too), 16 warps per block in
+    several blocks, reading a neighbor's element right after
+    `store_matrix_sync`, `satf`, `__float_to_tf32` (NaN too), CUDA's
+    elements per lane, the fast
+    half conversion against `__half2float` for every half, and the compute
+    capability that `CUDA4CPU_COMPUTE_CAPABILITY=7.5` sets.
+    `wmma_invalid_capability`: a wrong value is reported and ignored.
   - `stencil{2,3}d`: shared memory, `__constant__` and `__syncthreads`, checked
     against a host reference
   - `vectorize` (`vectorize.cu`): kernels without barriers (odd block sizes,
@@ -431,8 +507,11 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
     (mismatches by index, an order-dependent kernel, an overflow inside an
     allocation's rounding, templates, HIP, invalid requests).
   - `driver_hipcc_tools` (`driver/test_hipcc.py`): `hipconfig`'s answers,
-    `hipcc --version`, the `HIPCC_*` variables, `--emit-static-lib`, and a
-    program the host compiler links with `-L<toolkit>/lib -lamdhip64`.
+    `hipcc --version`, the `HIPCC_*` variables, `--emit-static-lib`, a
+    program the host compiler links with `-L<toolkit>/lib -lamdhip64`, and
+    HIP's AMD platform: the switch and the environment variable, the GPU
+    `--offload-arch` names, NVIDIA's by default, and the errors (another
+    GPU, two, wave64, an unknown platform).
   - `cmake_language_{cuda,hip}` (`cmake-language/`): projects written for
     CMake's CUDA language (`find_package(CUDAToolkit)`, a static library
     with separable compilation, a C++17 `.cpp` file that includes
@@ -454,6 +533,12 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
     `hip_bf16.h`, complex numbers through `hip_complex.h`, the platform
     macros) and `hip_template_launch` (`HIP_TEMPLATE_KERNEL_LAUNCH`, in a
     `.cpp` file, with `hipExtLaunchKernelGGL` too).
+    `hip_amdgcn` (`hip/amdgcn.hip`, built with `__HIP_PLATFORM_AMD__` and
+    `__gfx1101__`): the AMD platform's macros and device properties,
+    dispatch IDs, every lane operation and DPP control against tables from
+    the ISA with three sets of exited lanes (outside EXEC), rocPRIM's DPP
+    scan and reduction, a spin-wait with `s_sleep`, and the integer,
+    floating-point and atomic builtins.
 
 ## How execution works (read before touching `launch.hpp`)
 
@@ -571,7 +656,16 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
 - `__activemask()` (and `coalesced_threads()`) is the `op_converge` warp
   operation, keyed by its call site. It is released once every live lane that
   isn't at a barrier is in `warp_wait`, whatever it waits for, and returns the
-  lanes waiting at the same call site. This can't deadlock with other warp
+  lanes waiting at the same call site. Of the pending calls, the one
+  completed (`release_converge`) is the one a GPU would run first
+  (`runs_first`): in the same file, the earlier line, since a branch's or
+  a loop's body comes before the code after it; else the call a lane began
+  waiting at first. Lanes after a branch then wait for the branch's lanes,
+  and lanes that left two branches meet at the calls after them, in every
+  thread order (`hip_amdgcn`'s `branches` and `reconverge`): completing the
+  call of the lane that arrived last, as before, split them by when they
+  had arrived. The line comes back from the site's bits 47 and up
+  (`detail::call_site`). This can't deadlock with other warp
   operations, which wait for converging lanes: those only need everyone to be
   blocked. The rare operations (matches, converge) are `[[gnu::noinline]]`
   methods of `fibers`, out of `try_release_warp`'s hot path.
@@ -691,8 +785,8 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
 - `gridDim` and `blockDim` are object-like macros, so any struct field with
   those names breaks. CUDA's `cudaKernelNodeParams` has them: ours are named
   `cuda4cpu_gridDim`/`cuda4cpu_blockDim`, and the rewriter renames member
-  accesses. Name new fields like that if a CUDA struct needs them
-  (`cudaLaunchConfig_t` does).
+  accesses, and variables the program declares with those names. Name new
+  fields like that if a CUDA struct needs them (`cudaLaunchConfig_t` does).
 - Kernel nodes and `cudaLaunchKernel(const void *)` find a kernel's binder in
   a registry keyed by address, filled by `kernel_address()`. Launches of a
   typed function pointer don't need it.
@@ -758,7 +852,9 @@ Build trees live in `build/<preset>/` (git-ignored). The presets export
   warp_random[:seed], mixed[:seed]),
   `CUDA4CPU_DIVERGENT_BARRIERS` (warn, error, ignore) and
   `CUDA4CPU_INTERLEAVE` (auto, off, or a number of loop iterations).
-  `CUDA4CPU_MEMCPY_DIRECTION` (warn, error, ignore) is read in
+  `CUDA4CPU_COMPUTE_CAPABILITY` (major.minor; 6.0 by default) is read in
+  `get_device_properties`, for programs that check it before using
+  `mma.h`. `CUDA4CPU_MEMCPY_DIRECTION` (warn, error, ignore) is read in
   `lib/memory.cpp`, by `check_copy_direction`, which checks a copy's pointers
   against the registry of allocations, and so are `CUDA4CPU_INIT_MEMORY` (a
   byte that `initialize_allocation` fills new allocations with, graph

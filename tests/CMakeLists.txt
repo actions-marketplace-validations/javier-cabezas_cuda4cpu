@@ -182,6 +182,22 @@ set_target_properties(complex PROPERTIES CXX_EXTENSIONS OFF)
 cuda4cpu_add_cuda_sources(complex complex.cu)
 add_test(NAME complex COMMAND complex)
 
+add_executable(async_copy)
+set_target_properties(async_copy PROPERTIES CXX_EXTENSIONS OFF)
+cuda4cpu_add_cuda_sources(async_copy async_copy.cu)
+add_test(NAME async_copy COMMAND async_copy)
+
+add_executable(wmma)
+set_target_properties(wmma PROPERTIES CXX_EXTENSIONS OFF)
+cuda4cpu_add_cuda_sources(wmma wmma.cu)
+add_test(NAME wmma COMMAND wmma)
+set_tests_properties(wmma PROPERTIES ENVIRONMENT "CUDA4CPU_COMPUTE_CAPABILITY=7.5")
+# A wrong compute capability is reported and ignored
+add_test(NAME wmma_invalid_capability COMMAND wmma)
+set_tests_properties(wmma_invalid_capability PROPERTIES
+                     ENVIRONMENT "CUDA4CPU_COMPUTE_CAPABILITY=7"
+                     PASS_REGULAR_EXPRESSION "ignoring CUDA4CPU_COMPUTE_CAPABILITY=7: expected <major>\\.<minor>, such as 7\\.0(.|\n)*wmma: PASS")
+
 # Loops with interleaved threads (loop ticks inserted by the rewriter), with
 # the interleaving chosen per kernel, off, and fixed
 add_executable(interleave)
@@ -217,6 +233,15 @@ foreach(source IN ITEMS hip/runtime.hip hip/memory.hip hip/kernels.hip hip/templ
     add_test(NAME hip_${stem} COMMAND hip_${stem})
 endforeach()
 set_tests_properties(hip_memory PROPERTIES ENVIRONMENT "CUDA4CPU_MEMCPY_DIRECTION=error")
+
+# HIP's AMD platform, emulating gfx1101, and AMD's builtins
+add_executable(hip_amdgcn)
+set_target_properties(hip_amdgcn PROPERTIES CXX_EXTENSIONS OFF)
+cuda4cpu_add_hip_sources(hip_amdgcn hip/amdgcn.hip)
+target_compile_definitions(hip_amdgcn PRIVATE __HIP_PLATFORM_AMD__=1 __gfx1101__=1)
+add_test(NAME hip_amdgcn COMMAND hip_amdgcn)
+# Lanes in branches must never meet at different warp operations
+set_tests_properties(hip_amdgcn PROPERTIES ENVIRONMENT "CUDA4CPU_DIVERGENT_BARRIERS=error")
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME rewrite_unit

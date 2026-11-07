@@ -12,11 +12,13 @@ target_sources(cuda4cpu
             ${CUDA4CPU_INCLUDE_DIR}/cooperative_groups.h
             ${CUDA4CPU_INCLUDE_DIR}/cooperative_groups/reduce.h
             ${CUDA4CPU_INCLUDE_DIR}/cooperative_groups/scan.h
+            ${CUDA4CPU_INCLUDE_DIR}/cooperative_groups/memcpy_async.h
             ${CUDA4CPU_INCLUDE_DIR}/cuda.h
             ${CUDA4CPU_INCLUDE_DIR}/cuComplex.h
             ${CUDA4CPU_INCLUDE_DIR}/cuda_bf16.h
             ${CUDA4CPU_INCLUDE_DIR}/cuda_fp16.h
             ${CUDA4CPU_INCLUDE_DIR}/cuda_fp8.h
+            ${CUDA4CPU_INCLUDE_DIR}/mma.h
             ${CUDA4CPU_INCLUDE_DIR}/nvToolsExt.h
             ${CUDA4CPU_INCLUDE_DIR}/nvtx3/nvToolsExt.h
             ${CUDA4CPU_INCLUDE_DIR}/cuda_runtime.h
@@ -26,6 +28,7 @@ target_sources(cuda4cpu
             ${CUDA4CPU_INCLUDE_DIR}/vector_functions.h
             ${CUDA4CPU_INCLUDE_DIR}/vector_types.h
             ${CUDA4CPU_INCLUDE_DIR}/defines.hpp
+            ${CUDA4CPU_INCLUDE_DIR}/hip/amdgcn.h
             ${CUDA4CPU_INCLUDE_DIR}/hip/hip_common.h
             ${CUDA4CPU_INCLUDE_DIR}/hip/hip_cooperative_groups.h
             ${CUDA4CPU_INCLUDE_DIR}/hip/hip_ext.h
@@ -39,7 +42,12 @@ target_sources(cuda4cpu
             ${CUDA4CPU_INCLUDE_DIR}/hip/hip_version.h
             ${CUDA4CPU_INCLUDE_DIR}/launch.hpp
             ${CUDA4CPU_INCLUDE_DIR}/warp.hpp
+            ${CUDA4CPU_INCLUDE_DIR}/cuda/async_copy.hpp
             ${CUDA4CPU_INCLUDE_DIR}/cuda/atomics.hpp
+            ${CUDA4CPU_INCLUDE_DIR}/cuda/barrier
+            ${CUDA4CPU_INCLUDE_DIR}/cuda/cmath
+            ${CUDA4CPU_INCLUDE_DIR}/cuda/pipeline
+            ${CUDA4CPU_INCLUDE_DIR}/cuda/std/type_traits
             ${CUDA4CPU_INCLUDE_DIR}/cuda/device.hpp
             ${CUDA4CPU_INCLUDE_DIR}/cuda/error.hpp
             ${CUDA4CPU_INCLUDE_DIR}/cuda/events.hpp
